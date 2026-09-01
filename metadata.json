@@ -1,0 +1,10 @@
+{
+  "name": "Love Link",
+  "description": "Two-way real-time couple connection app with tactile signals, presence, and background notifications.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
