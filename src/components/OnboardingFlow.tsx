@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion } from 'motion/react';
 import QRCode from 'qrcode';
+import jsQR from 'jsqr';
 import {
   Heart,
   Copy,
@@ -11,7 +12,9 @@ import {
   ArrowLeft,
   Sparkles,
   RefreshCw,
-  AlertCircle
+  AlertCircle,
+  Upload,
+  X
 } from 'lucide-react';
 import { useLoveLink } from '../context/LoveLinkContext';
 
@@ -37,6 +40,8 @@ export const OnboardingFlow: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const qrStreamRef = useRef<MediaStream | null>(null);
+  const scanAnimFrameRef = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // If connection is already paired while on create_waiting screen, transition to success
   useEffect(() => {
@@ -79,42 +84,65 @@ export const OnboardingFlow: React.FC = () => {
     return cleaned;
   };
 
+  const handleScannedCode = (rawText: string) => {
+    try {
+      const match = rawText.match(/join=([A-Za-z0-9-]+)/i) || [null, rawText];
+      const extracted = match[1] || rawText;
+      const formatted = formatPairingCode(extracted);
+      if (formatted.length >= 6) {
+        setJoinCode(formatted);
+        stopQRScanner();
+        setErrorMsg(null);
+      } else if (rawText.trim()) {
+        setJoinCode(formatPairingCode(rawText));
+        stopQRScanner();
+        setErrorMsg(null);
+      }
+    } catch (err) {
+      console.warn('Error parsing scanned QR text:', err);
+    }
+  };
+
   const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!myName.trim()) {
+    const cleanName = myName.trim();
+    if (!cleanName) {
       setErrorMsg('Please enter your name');
       return;
     }
     setIsLoading(true);
     setErrorMsg(null);
-    const result = await createConnection(myName.trim(), partnerCustomName.trim() || undefined);
+    const result = await createConnection(cleanName, partnerCustomName.trim() || undefined);
     setIsLoading(false);
     if (result.success) {
       setStep('create_waiting');
     } else {
-      setErrorMsg(result.error || 'Failed to create room');
+      setErrorMsg(result.error || 'Failed to create sanctuary. Please try again.');
     }
   };
 
   const handleJoinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!joinCode.trim() || joinCode.length < 6) {
+    const cleanCode = joinCode.trim().replace(/[^A-Z0-9-]/gi, '');
+    const cleanName = myName.trim();
+
+    if (!cleanCode || cleanCode.replace(/-/g, '').length < 6) {
       setErrorMsg('Please enter a valid 6-character connection code');
       return;
     }
-    if (!myName.trim()) {
+    if (!cleanName) {
       setErrorMsg('Please enter your name');
       return;
     }
 
     setIsLoading(true);
     setErrorMsg(null);
-    const result = await joinConnection(joinCode.trim(), myName.trim(), partnerCustomName.trim() || undefined);
+    const result = await joinConnection(cleanCode, cleanName, partnerCustomName.trim() || undefined);
     setIsLoading(false);
     if (result.success) {
       setStep('connected_success');
     } else {
-      setErrorMsg(result.error || 'Failed to join connection');
+      setErrorMsg(result.error || 'Failed to join connection. Check code and try again.');
     }
   };
 
@@ -147,61 +175,119 @@ export const OnboardingFlow: React.FC = () => {
     }
   };
 
-  // Camera QR Code Scanner with BarcodeDetector or video stream
+  // Continuous frame scanner using jsQR + BarcodeDetector fallback
+  const scanVideoFrame = () => {
+    if (!videoRef.current || !qrStreamRef.current) return;
+    const video = videoRef.current;
+
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0) {
+      try {
+        const offscreenCanvas = document.createElement('canvas');
+        offscreenCanvas.width = video.videoWidth;
+        offscreenCanvas.height = video.videoHeight;
+        const ctx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, offscreenCanvas.width, offscreenCanvas.height);
+          const imageData = ctx.getImageData(0, 0, offscreenCanvas.width, offscreenCanvas.height);
+          const code = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: 'attemptBoth'
+          });
+          if (code && code.data) {
+            handleScannedCode(code.data);
+            return;
+          }
+        }
+      } catch {
+        // frame read fallback
+      }
+    }
+
+    scanAnimFrameRef.current = requestAnimationFrame(scanVideoFrame);
+  };
+
+  // Camera QR Code Scanner with jsQR and BarcodeDetector
   const startQRScanner = async () => {
     setIsScanningQR(true);
     setErrorMsg(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' }
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 } }
+        });
+      } catch {
+        // fallback to standard video constraint
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      }
+
       qrStreamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.play();
+        videoRef.current.setAttribute('playsinline', 'true');
+        videoRef.current.play().catch(() => {});
 
-        // Check if BarcodeDetector API is supported
-        if ('BarcodeDetector' in window) {
-          const barcodeDetector = new (window as any).BarcodeDetector({
-            formats: ['qr_code']
-          });
-
-          const scanInterval = setInterval(async () => {
-            if (!videoRef.current || !qrStreamRef.current) {
-              clearInterval(scanInterval);
-              return;
-            }
-            try {
-              const barcodes = await barcodeDetector.detect(videoRef.current);
-              if (barcodes.length > 0) {
-                const rawValue = barcodes[0].rawValue;
-                // Parse code from URL or raw string
-                const match = rawValue.match(/join=([A-Za-z0-9-]+)/) || [null, rawValue];
-                if (match[1]) {
-                  setJoinCode(formatPairingCode(match[1]));
-                  stopQRScanner();
-                  clearInterval(scanInterval);
-                }
-              }
-            } catch {
-              // ignore frame read error
-            }
-          }, 400);
-        }
+        // Start jsQR frame scanner loop
+        scanAnimFrameRef.current = requestAnimationFrame(scanVideoFrame);
       }
-    } catch (err) {
-      console.warn('Camera access error:', err);
-      setErrorMsg('Camera access was not granted. Please enter the pairing code manually.');
+    } catch (err: any) {
+      console.warn('Camera access note:', err);
+      setErrorMsg('Camera access was not granted. You can upload an image or enter the code manually.');
       setIsScanningQR(false);
     }
   };
 
   const stopQRScanner = () => {
+    if (scanAnimFrameRef.current) {
+      cancelAnimationFrame(scanAnimFrameRef.current);
+      scanAnimFrameRef.current = null;
+    }
     if (qrStreamRef.current) {
       qrStreamRef.current.getTracks().forEach((track) => track.stop());
       qrStreamRef.current = null;
     }
     setIsScanningQR(false);
+  };
+
+  // Clean up camera on unmount
+  useEffect(() => {
+    return () => {
+      stopQRScanner();
+    };
+  }, []);
+
+  // Upload and decode QR code from screenshot or gallery image
+  const handleImageFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(img, 0, 0);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imageData.data, imageData.width, imageData.height, {
+              inversionAttempts: 'attemptBoth'
+            });
+            if (code && code.data) {
+              handleScannedCode(code.data);
+            } else {
+              setErrorMsg('No QR code detected in image. Please check or enter the 6-character code manually.');
+            }
+          }
+        } catch {
+          setErrorMsg('Could not read image file.');
+        }
+      };
+      img.src = event.target?.result as string;
+    };
+    reader.readAsDataURL(file);
   };
 
   return (
@@ -277,7 +363,7 @@ export const OnboardingFlow: React.FC = () => {
         >
           <button
             onClick={() => setStep('welcome')}
-            className="flex items-center gap-1.5 text-xs text-stone-400 hover:text-stone-200 font-serif"
+            className="flex items-center gap-1.5 text-xs text-stone-400 hover:text-stone-200 font-serif cursor-pointer"
           >
             <ArrowLeft className="w-4 h-4" />
             <span>Back</span>
@@ -293,7 +379,7 @@ export const OnboardingFlow: React.FC = () => {
             </p>
           </div>
 
-          <form onSubmit={handleCreateSubmit} className="space-y-4 pt-2">
+          <form onSubmit={handleCreateSubmit} noValidate={false} className="space-y-4 pt-2">
             <div>
               <label htmlFor="create-my-name" className="block text-xs font-medium text-stone-400 mb-1.5 font-reading">
                 Your Inscription (Name)
@@ -304,7 +390,10 @@ export const OnboardingFlow: React.FC = () => {
                 required
                 maxLength={24}
                 value={myName}
-                onChange={(e) => setMyName(e.target.value)}
+                onChange={(e) => {
+                  setMyName(e.target.value);
+                  if (errorMsg) setErrorMsg(null);
+                }}
                 placeholder="e.g. Yash"
                 className="w-full px-4 py-3 rounded-2xl bg-stone-950 border border-stone-800 text-sm text-stone-100 placeholder-stone-600 focus:outline-none focus:border-rose-500/50"
                 autoFocus
@@ -378,7 +467,7 @@ export const OnboardingFlow: React.FC = () => {
             <button
               id="copy-pairing-code-button"
               onClick={handleCopyCode}
-              className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-2xl bg-stone-900 hover:bg-stone-800 border border-stone-800 text-xs font-serif font-semibold tracking-wider text-stone-200 transition active:scale-98"
+              className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-2xl bg-stone-900 hover:bg-stone-800 border border-stone-800 text-xs font-serif font-semibold tracking-wider text-stone-200 transition active:scale-98 cursor-pointer"
             >
               {isCopied ? (
                 <>
@@ -396,7 +485,7 @@ export const OnboardingFlow: React.FC = () => {
             <button
               id="share-pairing-link-button"
               onClick={handleShare}
-              className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-2xl bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-xs font-serif font-semibold tracking-wider text-rose-300 transition"
+              className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-2xl bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/30 text-xs font-serif font-semibold tracking-wider text-rose-300 transition cursor-pointer"
             >
               <Share2 className="w-4 h-4" />
               <span>TRANSMIT LINK</span>
@@ -423,7 +512,7 @@ export const OnboardingFlow: React.FC = () => {
               stopQRScanner();
               setStep('welcome');
             }}
-            className="flex items-center gap-1.5 text-xs text-stone-400 hover:text-stone-200 font-serif"
+            className="flex items-center gap-1.5 text-xs text-stone-400 hover:text-stone-200 font-serif cursor-pointer"
           >
             <ArrowLeft className="w-4 h-4" />
             <span>Back</span>
@@ -439,35 +528,85 @@ export const OnboardingFlow: React.FC = () => {
             </p>
           </div>
 
+          {/* Hidden File Input for Image QR upload */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={handleImageFileChange}
+          />
+
           {/* QR Scanner view if active */}
           {isScanningQR ? (
             <div className="space-y-3">
-              <div className="relative w-full aspect-square rounded-3xl overflow-hidden bg-black border-2 border-rose-500/50 shadow-xl">
-                <video ref={videoRef} className="w-full h-full object-cover" />
-                <div className="absolute inset-8 border-2 border-dashed border-rose-400/70 rounded-2xl pointer-events-none animate-pulse" />
+              <div className="relative w-full aspect-square rounded-3xl overflow-hidden bg-black border-2 border-rose-500/50 shadow-2xl flex items-center justify-center">
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  muted
+                  playsInline
+                  className="w-full h-full object-cover"
+                />
+                <div className="absolute inset-8 border-2 border-dashed border-rose-400/80 rounded-2xl pointer-events-none animate-pulse" />
+                <div className="absolute top-3 right-3">
+                  <button
+                    onClick={stopQRScanner}
+                    className="p-2 rounded-full bg-stone-900/80 text-stone-200 hover:text-white border border-stone-700 backdrop-blur-md cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+                <div className="absolute bottom-3 inset-x-3 text-center">
+                  <span className="text-[11px] font-mono px-3 py-1 rounded-full bg-stone-950/80 border border-stone-800 text-stone-300 backdrop-blur-md">
+                    Align QR code within frame
+                  </span>
+                </div>
               </div>
-              <button
-                onClick={stopQRScanner}
-                className="w-full py-2.5 rounded-xl bg-stone-800 text-xs font-serif font-semibold text-stone-300"
-              >
-                Close Scanner
-              </button>
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-stone-900 border border-stone-800 text-xs font-serif font-semibold text-stone-300 hover:bg-stone-800 transition cursor-pointer"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Upload QR Image</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={stopQRScanner}
+                  className="px-4 py-2.5 rounded-xl bg-stone-900 border border-stone-800 text-xs font-serif font-semibold text-stone-300 hover:bg-stone-800 transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+              </div>
             </div>
           ) : (
-            <form onSubmit={handleJoinSubmit} className="space-y-4 pt-1">
+            <form onSubmit={handleJoinSubmit} noValidate={false} className="space-y-4 pt-1">
               <div>
                 <div className="flex items-center justify-between mb-1.5">
                   <label htmlFor="join-code-input" className="text-xs font-medium text-stone-400 font-reading">
                     Sanctuary Code
                   </label>
-                  <button
-                    type="button"
-                    onClick={startQRScanner}
-                    className="flex items-center gap-1 text-[11px] text-rose-400 hover:text-rose-300 font-serif"
-                  >
-                    <Camera className="w-3.5 h-3.5" />
-                    <span>Scan QR</span>
-                  </button>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={startQRScanner}
+                      className="flex items-center gap-1 text-[11px] text-rose-400 hover:text-rose-300 font-serif cursor-pointer"
+                    >
+                      <Camera className="w-3.5 h-3.5" />
+                      <span>Camera</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="flex items-center gap-1 text-[11px] text-stone-400 hover:text-stone-300 font-serif cursor-pointer"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>Image</span>
+                    </button>
+                  </div>
                 </div>
 
                 <input
@@ -476,7 +615,10 @@ export const OnboardingFlow: React.FC = () => {
                   required
                   maxLength={7}
                   value={joinCode}
-                  onChange={(e) => setJoinCode(formatPairingCode(e.target.value))}
+                  onChange={(e) => {
+                    setJoinCode(formatPairingCode(e.target.value));
+                    if (errorMsg) setErrorMsg(null);
+                  }}
                   placeholder="e.g. 7KQ-29M"
                   className="w-full px-4 py-3.5 rounded-2xl bg-stone-950 border border-stone-800 text-base font-mono tracking-widest text-center text-stone-100 placeholder-stone-700 focus:outline-none focus:border-rose-500/50 uppercase"
                   autoFocus
@@ -493,7 +635,10 @@ export const OnboardingFlow: React.FC = () => {
                   required
                   maxLength={24}
                   value={myName}
-                  onChange={(e) => setMyName(e.target.value)}
+                  onChange={(e) => {
+                    setMyName(e.target.value);
+                    if (errorMsg) setErrorMsg(null);
+                  }}
                   placeholder="e.g. Her / Yash"
                   className="w-full px-4 py-3 rounded-2xl bg-stone-950 border border-stone-800 text-sm text-stone-100 placeholder-stone-600 focus:outline-none focus:border-rose-500/50"
                 />
@@ -568,7 +713,6 @@ export const OnboardingFlow: React.FC = () => {
           <button
             id="continue-to-home-button"
             onClick={() => {
-              // Reload context state
               window.location.reload();
             }}
             className="w-full max-w-xs mx-auto py-3.5 px-6 rounded-2xl bg-rose-900/90 hover:bg-rose-800 text-white font-serif font-semibold text-xs tracking-wider shadow-xl shadow-rose-950/50 transition cursor-pointer border border-rose-700/50"
@@ -580,3 +724,4 @@ export const OnboardingFlow: React.FC = () => {
     </div>
   );
 };
+

@@ -4,7 +4,8 @@ import crypto from 'crypto';
 import webpush from 'web-push';
 import { DatabaseSchema, Connection, Signal, PushSubscriptionData, SignalType, User } from './types';
 
-const DATA_DIR = path.join(process.cwd(), 'data');
+const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const DATA_DIR = isServerless ? path.join('/tmp', 'lovelink-data') : path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 
 // In-memory state initialized from file
@@ -18,13 +19,13 @@ let db: DatabaseSchema = {
   pushSubscriptions: {}
 };
 
-// Ensure data directory exists
-if (!fs.existsSync(DATA_DIR)) {
-  try {
+// Ensure data directory exists safely
+try {
+  if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-  } catch (err) {
-    console.error('Failed to create data directory:', err);
   }
+} catch (err) {
+  console.warn('Storage directory initialization warning (using in-memory):', err);
 }
 
 // Load database if exists, or initialize

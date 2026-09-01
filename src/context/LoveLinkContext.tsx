@@ -44,6 +44,49 @@ const DEFAULT_SETTINGS: AppSettings = {
   reducedMotion: false
 };
 
+// Helper to safely parse API responses without throwing DOMException / SyntaxError
+async function safeApiCall<T = any>(
+  url: string,
+  options?: RequestInit
+): Promise<{ ok: boolean; status: number; data?: T; error?: string }> {
+  try {
+    const res = await fetch(url, options);
+    const text = await res.text();
+    let parsed: any = null;
+    if (text) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
+    }
+
+    if (res.ok) {
+      if (parsed === null && text && (text.trim().startsWith('<') || text.includes('<!DOCTYPE') || text.includes('<html'))) {
+        return {
+          ok: false,
+          status: res.status,
+          error: 'Service endpoint not reachable. Please verify server status.'
+        };
+      }
+      return { ok: true, status: res.status, data: parsed as T };
+    } else {
+      const errorMsg =
+        parsed?.error ||
+        parsed?.message ||
+        (res.status === 404
+          ? 'Sanctuary connection not found (404).'
+          : res.status === 500
+          ? 'Server encountered an issue (500).'
+          : `Request failed (${res.status})`);
+      return { ok: false, status: res.status, error: errorMsg };
+    }
+  } catch (err: any) {
+    console.warn(`API call failed for ${url}:`, err);
+    return { ok: false, status: 0, error: err?.message || 'Network connection error' };
+  }
+}
+
 export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [connection, setConnection] = useState<Connection | null>(null);
   const [user, setUser] = useState<User | null>(null);
@@ -132,8 +175,8 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const fetchConnectionData = async (connId: string, currentUserId: string) => {
     try {
       setConnectionState('connecting');
-      const res = await fetch(`/api/connections/${connId}`);
-      if (!res.ok) {
+      const res = await safeApiCall<{ connection: Connection }>(`/api/connections/${connId}`);
+      if (!res.ok || !res.data?.connection) {
         if (res.status === 404) {
           // Connection expired or invalid
           localStorage.removeItem(STORAGE_KEYS.CONNECTION_ID);
@@ -145,11 +188,15 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         return;
       }
 
-      const data = await res.json();
-      const conn: Connection = data.connection;
+      const conn: Connection = res.data.connection;
       setConnection(conn);
 
-      const currentUser = conn.user_a.id === currentUserId ? conn.user_a : (conn.user_b?.id === currentUserId ? conn.user_b : null);
+      const currentUser =
+        conn.user_a.id === currentUserId
+          ? conn.user_a
+          : conn.user_b?.id === currentUserId
+          ? conn.user_b
+          : null;
       if (currentUser) {
         setUser(currentUser);
       } else {
@@ -162,18 +209,17 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
 
       // Fetch signals history
-      const signalsRes = await fetch(`/api/connections/${connId}/signals`);
-      if (signalsRes.ok) {
-        const sigData = await signalsRes.json();
-        setSignals(sigData.signals || []);
+      const signalsRes = await safeApiCall<{ signals: Signal[] }>(`/api/connections/${connId}/signals`);
+      if (signalsRes.ok && signalsRes.data?.signals) {
+        setSignals(signalsRes.data.signals);
       }
     } catch (err) {
-      console.error('Failed to fetch connection data:', err);
+      console.warn('Failed to fetch connection data:', err);
       setConnectionState('disconnected');
     }
   };
 
-  // Manage WebSocket connection
+  // Manage WebSocket connection with polling fallback for serverless/offline
   useEffect(() => {
     if (!connection || !user) {
       if (socketRef.current) {
@@ -218,7 +264,7 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       } else if (msg.type === 'connection_updated') {
         setConnection(msg.connection);
       } else if (msg.type === 'connection_disconnected') {
-        setConnection((prev) => prev ? { ...prev, status: 'disconnected' } : null);
+        setConnection((prev) => (prev ? { ...prev, status: 'disconnected' } : null));
       } else if (msg.type === 'signal_received') {
         const sig: Signal = msg.signal;
         // Add to signals list (avoid duplicate)
@@ -242,7 +288,61 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     socket.connect();
 
+    // Polling fallback when websocket is not open (e.g. serverless environments or reconnecting)
+    const pollInterval = setInterval(async () => {
+      if (!connection?.id || !user?.id) return;
+      try {
+        // Poll connection state
+        const cRes = await safeApiCall<{ connection: Connection }>(`/api/connections/${connection.id}`);
+        if (cRes.ok && cRes.data?.connection) {
+          const freshConn = cRes.data.connection;
+          setConnection((prev) => {
+            if (prev?.status === 'waiting' && freshConn.status === 'paired') {
+              triggerHaptic('success', settings.vibrationEnabled);
+              playSignalSound('love', settings.soundEnabled);
+            }
+            return freshConn;
+          });
+
+          // Update partner presence based on lastSeen
+          const other = freshConn.user_a.id === user.id ? freshConn.user_b : freshConn.user_a;
+          if (other) {
+            const isRecent = Date.now() - (other.lastSeen || 0) < 60000;
+            setPartnerPresence({
+              userId: other.id,
+              isOnline: isRecent,
+              lastSeen: other.lastSeen || Date.now()
+            });
+          }
+        }
+
+        // Poll latest signals
+        const sRes = await safeApiCall<{ signals: Signal[] }>(`/api/connections/${connection.id}/signals`);
+        if (sRes.ok && sRes.data?.signals) {
+          const fetched = sRes.data.signals;
+          setSignals((prev) => {
+            const prevIds = new Set(prev.map((s) => s.id));
+            const newSignals = fetched.filter((s) => !prevIds.has(s.id));
+            if (newSignals.length > 0) {
+              // Trigger newest incoming signal if meant for me
+              const newestForMe = newSignals.find((s) => s.recipientId === user.id);
+              if (newestForMe) {
+                setActiveIncomingSignal(newestForMe);
+                playSignalSound(newestForMe.type, settings.soundEnabled);
+                triggerHaptic(newestForMe.type, settings.vibrationEnabled);
+              }
+              return [...newSignals, ...prev];
+            }
+            return prev;
+          });
+        }
+      } catch {
+        // silent polling catch
+      }
+    }, 2500);
+
     return () => {
+      clearInterval(pollInterval);
       socket.disconnect();
     };
   }, [connection?.id, user?.id, settings.soundEnabled, settings.vibrationEnabled, partner?.id]);
@@ -255,53 +355,49 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const createConnection = async (userName: string, customPartnerName?: string) => {
     try {
-      const res = await fetch('/api/connections/create', {
+      const res = await safeApiCall<{ connection: Connection; user: User }>('/api/connections/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userName, customPartnerName })
       });
 
-      if (!res.ok) {
-        const err = await res.json();
-        return { success: false, error: err.error || 'Failed to create connection' };
+      if (!res.ok || !res.data) {
+        return { success: false, error: res.error || 'Failed to create room' };
       }
 
-      const data = await res.json();
-      setConnection(data.connection);
-      setUser(data.user);
-      localStorage.setItem(STORAGE_KEYS.CONNECTION_ID, data.connection.id);
-      localStorage.setItem(STORAGE_KEYS.USER_ID, data.user.id);
+      setConnection(res.data.connection);
+      setUser(res.data.user);
+      localStorage.setItem(STORAGE_KEYS.CONNECTION_ID, res.data.connection.id);
+      localStorage.setItem(STORAGE_KEYS.USER_ID, res.data.user.id);
       triggerHaptic('success', settings.vibrationEnabled);
       return { success: true };
     } catch (err: any) {
-      return { success: false, error: err.message || 'Network error' };
+      return { success: false, error: err?.message || 'Network error' };
     }
   };
 
   const joinConnection = async (pairingCode: string, userName: string, customPartnerName?: string) => {
     try {
-      const res = await fetch('/api/connections/join', {
+      const res = await safeApiCall<{ connection: Connection; user: User }>('/api/connections/join', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pairingCode, userName, customPartnerName })
       });
 
-      if (!res.ok) {
-        const err = await res.json();
-        return { success: false, error: err.error || 'Failed to join connection' };
+      if (!res.ok || !res.data) {
+        return { success: false, error: res.error || 'Failed to join connection' };
       }
 
-      const data = await res.json();
-      setConnection(data.connection);
-      setUser(data.user);
-      localStorage.setItem(STORAGE_KEYS.CONNECTION_ID, data.connection.id);
-      localStorage.setItem(STORAGE_KEYS.USER_ID, data.user.id);
+      setConnection(res.data.connection);
+      setUser(res.data.user);
+      localStorage.setItem(STORAGE_KEYS.CONNECTION_ID, res.data.connection.id);
+      localStorage.setItem(STORAGE_KEYS.USER_ID, res.data.user.id);
 
       triggerHaptic('success', settings.vibrationEnabled);
       playSignalSound('love', settings.soundEnabled);
       return { success: true };
     } catch (err: any) {
-      return { success: false, error: err.message || 'Network error' };
+      return { success: false, error: err?.message || 'Network error' };
     }
   };
 
@@ -315,7 +411,7 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     playSignalSound('sent', settings.soundEnabled);
 
     try {
-      const res = await fetch(`/api/connections/${connection.id}/signals`, {
+      const res = await safeApiCall<{ signal: Signal }>(`/api/connections/${connection.id}/signals`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -325,13 +421,11 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         })
       });
 
-      if (!res.ok) {
-        const err = await res.json();
-        return { success: false, error: err.error || 'Failed to send' };
+      if (!res.ok || !res.data?.signal) {
+        return { success: false, error: res.error || 'Failed to send' };
       }
 
-      const data = await res.json();
-      const newSignal: Signal = data.signal;
+      const newSignal: Signal = res.data.signal;
 
       // Update local signals list
       setSignals((prev) => {
@@ -341,14 +435,14 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
       return { success: true, signal: newSignal };
     } catch (err: any) {
-      return { success: false, error: err.message || 'Network error' };
+      return { success: false, error: err?.message || 'Network error' };
     }
   };
 
   const markAsRead = async (signalId: string) => {
     if (!connection || !user) return;
     try {
-      await fetch(`/api/connections/${connection.id}/signals/${signalId}/read`, {
+      await safeApiCall(`/api/connections/${connection.id}/signals/${signalId}/read`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.id })
@@ -364,7 +458,7 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const updateNames = async (name: string, customPartnerName?: string) => {
     if (!connection || !user) return;
     try {
-      const res = await fetch(`/api/connections/${connection.id}/update-name`, {
+      const res = await safeApiCall<{ connection: Connection }>(`/api/connections/${connection.id}/update-name`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -373,21 +467,20 @@ export const LoveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           customPartnerName
         })
       });
-      if (res.ok) {
-        const data = await res.json();
-        setConnection(data.connection);
-        setUser((prev) => prev ? { ...prev, name, customPartnerName } : null);
+      if (res.ok && res.data?.connection) {
+        setConnection(res.data.connection);
+        setUser((prev) => (prev ? { ...prev, name, customPartnerName } : null));
         triggerHaptic('success', settings.vibrationEnabled);
       }
     } catch (err) {
-      console.error('Update names error:', err);
+      console.warn('Update names error:', err);
     }
   };
 
   const disconnect = async () => {
     if (connection && user) {
       try {
-        await fetch(`/api/connections/${connection.id}/disconnect`, {
+        await safeApiCall(`/api/connections/${connection.id}/disconnect`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ userId: user.id })

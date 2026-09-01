@@ -1,14 +1,21 @@
 // Client-side Web Push subscription manager
 
-function urlBase64ToUint8Array(base64String: string): Uint8Array {
-  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
-  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
-  const rawData = window.atob(base64);
-  const outputArray = new Uint8Array(rawData.length);
-  for (let i = 0; i < rawData.length; ++i) {
-    outputArray[i] = rawData.charCodeAt(i);
+function urlBase64ToUint8Array(base64String: string): Uint8Array | null {
+  try {
+    if (!base64String || typeof base64String !== 'string') return null;
+    const cleanStr = base64String.trim();
+    const padding = '='.repeat((4 - (cleanStr.length % 4)) % 4);
+    const base64 = (cleanStr + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const rawData = window.atob(base64);
+    const outputArray = new Uint8Array(rawData.length);
+    for (let i = 0; i < rawData.length; ++i) {
+      outputArray[i] = rawData.charCodeAt(i);
+    }
+    return outputArray;
+  } catch (err) {
+    console.warn('Invalid base64 string provided to urlBase64ToUint8Array:', err);
+    return null;
   }
-  return outputArray;
 }
 
 export async function registerServiceWorker(): Promise<ServiceWorkerRegistration | null> {
@@ -51,16 +58,31 @@ export async function subscribeUserToPush(userId: string): Promise<boolean> {
     // Get public VAPID key from backend
     const res = await fetch('/api/push/vapid-public-key');
     if (!res.ok) {
-      throw new Error('Failed to fetch VAPID key');
+      console.warn('Could not fetch VAPID key (HTTP ' + res.status + ')');
+      return false;
     }
-    const { publicKey } = await res.json();
-    if (!publicKey) {
-      throw new Error('No VAPID public key received');
+    const text = await res.text();
+    let publicKey = '';
+    try {
+      const data = JSON.parse(text);
+      publicKey = data.publicKey;
+    } catch {
+      console.warn('Invalid VAPID response from server');
+      return false;
+    }
+
+    if (!publicKey || typeof publicKey !== 'string' || publicKey.length < 10) {
+      console.warn('No valid VAPID public key received');
+      return false;
     }
 
     let subscription = await registration.pushManager.getSubscription();
     if (!subscription) {
       const convertedKey = urlBase64ToUint8Array(publicKey);
+      if (!convertedKey) {
+        console.warn('Failed to convert VAPID key');
+        return false;
+      }
       subscription = await registration.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: convertedKey
