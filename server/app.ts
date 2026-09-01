@@ -289,5 +289,11 @@ export function createExpressApp(): Express {
   app.use('/api', router);
   app.use('/', router);
 
+  // Global Error Handler to always return JSON errors
+  app.use((err: any, _req: Request, res: Response, _next: any) => {
+    console.error('Unhandled server error:', err);
+    res.status(500).json({ error: err?.message || 'Server encountered an issue. Please try again.' });
+  });
+
   return app;
 }
